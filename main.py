@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BW = 1.0
-ALPHA = 0.0
+ALPHA = 0.0  # tools/cv.py leave-one-launch-out: mean 0.408515 vs 0.477386 at 0.25; baseline 0.929650.
 SMOOTH = 3
 MIN_POINTS = 8
 
@@ -36,18 +36,25 @@ def positive(value):
 def first_viewers(case):
     rows = sorted(case.get("known", []), key=lambda r: json.dumps(r, sort_keys=True))
     for row in rows:
-        if row.get("hour") == 1:
-            value = float(row["viewers"])
-            if not math.isfinite(value):
-                raise ValueError("Nonfinite hour-1 viewers")
-            return max(1, value)
+        if isinstance(row, dict) and row.get("hour") == 1:
+            value = row.get("viewers")
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                return max(1, value)
+    for source in ("history_hourly", "history"):
+        for row in reversed(case.get(source) or []):
+            value = row.get("viewers") if isinstance(row, dict) else None
+            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+                return value
     return 1
 
 
 def is_launch(comparable):
+    if not isinstance(comparable, dict):
+        return False
+    # OR is deliberate: either marker identifies the one non-launch comparable.
     return not (
-        "before release" in comparable.get("name", "").lower()
-        or comparable.get("unlock", "").lower().startswith("not a launch")
+        "before release" in str(comparable.get("name") or "").lower()
+        or str(comparable.get("unlock") or "").lower().startswith("not a launch")
     )
 
 
@@ -121,17 +128,20 @@ def model_hours(case, p1):
         raise ValueError("Invalid smoothing window")
     pairs = {h: [] for h in HOURS}
     for comparable in sorted(case.get("comparables", []), key=lambda c: json.dumps(c, sort_keys=True)):
-        if not is_launch(comparable):
+        try:
+            if not is_launch(comparable):
+                continue
+            values = release_hours(comparable)
+            if 1 not in values:
+                continue
+            log_v1 = math.log(values[1])
+            distance = (math.log(p1) - log_v1) / BW
+            weight = math.exp(-0.5 * distance * distance)
+            for h in sorted(values):
+                if h in pairs:
+                    pairs[h].append((math.log(values[h]) - log_v1, weight))
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
-        values = release_hours(comparable)
-        if 1 not in values:
-            continue
-        log_v1 = math.log(values[1])
-        distance = (math.log(p1) - log_v1) / BW
-        weight = math.exp(-0.5 * distance * distance)
-        for h in sorted(values):
-            if h in pairs:
-                pairs[h].append((math.log(values[h]) - log_v1, weight))
     series = []
     for h in HOURS:
         if len(pairs[h]) < MIN_POINTS:
